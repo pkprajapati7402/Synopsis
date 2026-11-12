@@ -6,6 +6,7 @@ import { api } from "convex/_generated/api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { ExternalLink, GitPullRequest, Loader2 } from "lucide-react";
+import { exportSandboxFiles } from "@/lib/workerClient";
 
 type Sandbox = {
   id: string;
@@ -25,7 +26,36 @@ export function PrStatusCard({ sandbox }: PrStatusCardProps) {
   async function handleCreateOrUpdatePr() {
     setLoading(true);
     try {
-      const result = await createPullRequest({ sandboxId: sandbox.id });
+      let files: Record<string, string> | undefined;
+      try {
+        const exported = await exportSandboxFiles({ sandboxId: sandbox.id });
+        files = exported.files;
+      } catch (e) {
+        console.warn("Could not export files from worker directly:", e);
+      }
+      let token =
+        process.env.NEXT_PUBLIC_GITHUB_TOKEN ||
+        (typeof window !== "undefined" ? localStorage.getItem("synapse_github_token") : null);
+
+      if (!token) {
+        const inputToken = window.prompt(
+          "Enter your GitHub Personal Access Token (classic) to create the pull request on GitHub:\n\nTip: You can create a token with 'repo' scope at:\nhttps://github.com/settings/tokens"
+        );
+        if (!inputToken || !inputToken.trim()) {
+          setLoading(false);
+          return;
+        }
+        token = inputToken.trim();
+        if (typeof window !== "undefined") {
+          localStorage.setItem("synapse_github_token", token);
+        }
+      }
+
+      const result = await createPullRequest({
+        sandboxId: sandbox.id,
+        files,
+        githubToken: token,
+      });
       setPrUrl(result.prUrl);
     } catch (err) {
       console.error("Create/update PR failed:", err);

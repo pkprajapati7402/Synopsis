@@ -1,7 +1,103 @@
-import { getSandbox, proxyToSandbox } from '@cloudflare/sandbox';
+import { DurableObject } from 'cloudflare:workers';
+import { getSandbox, proxyToSandbox, Sandbox as CloudflareSandbox } from '@cloudflare/sandbox';
 import { STARTER_FILES, STUDIO_HTML } from './starterFiles.generated';
 
-export { Sandbox } from '@cloudflare/sandbox';
+export class Sandbox extends DurableObject {
+  ctx: DurableObjectState;
+  env: Env;
+  private delegate?: any;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.ctx = ctx;
+    this.env = env;
+    if ((ctx as any).container !== undefined) {
+      try {
+        this.delegate = new CloudflareSandbox(ctx as any, env as any);
+      } catch (e) {
+        console.warn('Could not initialize CloudflareSandbox container delegate:', e);
+      }
+    }
+  }
+
+  setSandboxName(name: string, normalizeId?: boolean) {
+    if (this.delegate?.setSandboxName) this.delegate.setSandboxName(name, normalizeId);
+  }
+
+  setBaseUrl(url: string) {
+    if (this.delegate?.setBaseUrl) this.delegate.setBaseUrl(url);
+  }
+
+  setSleepAfter(time: string) {
+    if (this.delegate?.setSleepAfter) this.delegate.setSleepAfter(time);
+  }
+
+  setKeepAlive(time: string) {
+    if (this.delegate?.setKeepAlive) this.delegate.setKeepAlive(time);
+  }
+
+  setContainerTimeouts(timeouts: any) {
+    if (this.delegate?.setContainerTimeouts) this.delegate.setContainerTimeouts(timeouts);
+  }
+
+  async validatePortToken(port: number, token?: string) {
+    if (this.delegate?.validatePortToken) return this.delegate.validatePortToken(port, token);
+    return true;
+  }
+
+  async mkdir(dir: string, options?: { recursive?: boolean }) {
+    if (this.delegate) return this.delegate.mkdir(dir, options);
+    return;
+  }
+
+  async listFiles(dir: string, options?: { recursive?: boolean }) {
+    if (this.delegate) return this.delegate.listFiles(dir, options);
+    const prefix = dir.endsWith('/') ? dir : `${dir}/`;
+    const entries = await this.ctx.storage.list<string>({ prefix });
+    const files: Array<{ type: 'file'; relativePath: string }> = [];
+    for (const [key] of entries) {
+      const rel = key.slice(prefix.length).replace(/^\/+/, '');
+      if (rel) {
+        files.push({ type: 'file', relativePath: rel });
+      }
+    }
+    return { files };
+  }
+
+  async readFile(filePath: string) {
+    if (this.delegate) return this.delegate.readFile(filePath);
+    const content = await this.ctx.storage.get<string>(filePath);
+    if (content === undefined) {
+      throw new Error(`File not found: ${filePath}`);
+    }
+    return { content };
+  }
+
+  async writeFile(filePath: string, content: string) {
+    if (this.delegate) return this.delegate.writeFile(filePath, content);
+    await this.ctx.storage.put(filePath, content);
+  }
+
+  async deleteFile(filePath: string) {
+    if (this.delegate) return this.delegate.deleteFile(filePath);
+    await this.ctx.storage.delete(filePath);
+  }
+
+  async getExposedPorts(hostname: string) {
+    if (this.delegate) return this.delegate.getExposedPorts(hostname);
+    return [{ port: 8080, url: `http://${hostname}:8080` }];
+  }
+
+  async startProcess(cmd: string, options?: { cwd?: string }) {
+    if (this.delegate) return this.delegate.startProcess(cmd, options);
+    return { pid: 1 };
+  }
+
+  async fetch(request: Request) {
+    if (this.delegate?.fetch) return this.delegate.fetch(request);
+    return new Response("OK", { status: 200 });
+  }
+}
 
 // ──────────────────────────────────────────────
 // Helpers
@@ -42,7 +138,11 @@ function json(body: unknown, init?: ResponseInit): Response {
 
 function parseMultiFile(raw: string): Record<string, string> {
   const files: Record<string, string> = {};
-  const blocks = raw.split(/^={3,}FILE:\s*/m);
+  let cleaned = raw.trim();
+  cleaned = cleaned.replace(/^```[a-zA-Z0-9_-]*\s*\n/i, '');
+  cleaned = cleaned.replace(/\n```\s*$/i, '');
+
+  const blocks = cleaned.split(/^={3,}FILE:\s*/m);
   for (const block of blocks) {
     if (!block.trim()) continue;
     const nlIdx = block.indexOf('\n');
@@ -51,6 +151,7 @@ function parseMultiFile(raw: string): Record<string, string> {
     if (!name) continue;
     let content = block.slice(nlIdx + 1);
     content = content.replace(/\n={3,}ENDFILE={0,3}\s*$/i, '');
+    content = content.replace(/```+\s*$/g, '').trimEnd();
     files[name] = content;
   }
   return files;
@@ -129,6 +230,56 @@ async function refinePromptWithGemini(apiKey: string, userPrompt: string): Promi
   if (data.error) throw new Error(data.error.message || 'Gemini API error');
   const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
   return text || trimmed;
+}
+
+async function generateCodeWithGemini(
+  apiKey: string,
+  systemPrompt: string,
+  messages: Array<{ role: string; content: string }>,
+): Promise<string> {
+  const url = `${GEMINI_API}/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+  const contents: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> = [];
+  for (const m of messages) {
+    if (m.role === 'system') continue;
+    contents.push({
+      role: m.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: m.content }],
+    });
+  }
+
+  if (contents.length === 0) {
+    contents.push({ role: 'user', parts: [{ text: 'Please process the request.' }] });
+  }
+
+  console.log('[gemini-code] Requesting code generation via Gemini 2.5 Flash...');
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+      contents,
+      generationConfig: {
+        maxOutputTokens: 8192,
+        temperature: 0.2,
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Gemini code generation failed ${res.status}: ${errText.slice(0, 250)}`);
+  }
+
+  const data = (await res.json()) as {
+    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    error?: { message?: string };
+  };
+
+  if (data.error) throw new Error(data.error.message || 'Gemini API error');
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+  console.log(`[gemini-code] Successfully generated code (${text.length} chars)`);
+  return text;
 }
 
 function storeMemory(
@@ -435,26 +586,42 @@ export default {
           content: `CURRENT FILES:\n\n${currentSnapshot}\nUSER REQUEST: ${promptToUse}`,
         });
 
-        let aiResponse;
-        try {
-          aiResponse = await env.AI.run(
-            '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
-            {
-              messages: messages as RoleScopedChatInput[],
-              max_tokens: 8192,
-              temperature: 0.3,
+        let rawResponse = '';
+        let aiErrMessage = '';
+
+        if (env.AI) {
+          try {
+            const aiResponse = await env.AI.run(
+              '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+              {
+                messages: messages as RoleScopedChatInput[],
+                max_tokens: 8192,
+                temperature: 0.3,
+              }
+            );
+            if (typeof aiResponse === 'string') {
+              rawResponse = aiResponse;
+            } else if (aiResponse && typeof aiResponse === 'object' && 'response' in aiResponse) {
+              rawResponse = (aiResponse as { response: string }).response;
             }
-          );
-        } catch (aiErr: unknown) {
-          const aiMsg = aiErr instanceof Error ? aiErr.message : String(aiErr);
-          return json({ error: `AI model error: ${aiMsg}` }, { status: 500 });
+          } catch (aiErr: unknown) {
+            aiErrMessage = aiErr instanceof Error ? aiErr.message : String(aiErr);
+            console.warn('[prompt] env.AI.run failed, falling back to Gemini:', aiErrMessage);
+          }
         }
 
-        let rawResponse = '';
-        if (typeof aiResponse === 'string') {
-          rawResponse = aiResponse;
-        } else if (aiResponse && typeof aiResponse === 'object' && 'response' in aiResponse) {
-          rawResponse = (aiResponse as { response: string }).response;
+        if (!rawResponse && geminiKey) {
+          try {
+            rawResponse = await generateCodeWithGemini(geminiKey, systemContent, messages);
+          } catch (gemErr: unknown) {
+            const gemMsg = gemErr instanceof Error ? gemErr.message : String(gemErr);
+            console.error('[prompt] Gemini code generation fallback also failed:', gemMsg);
+            if (!aiErrMessage) aiErrMessage = gemMsg;
+          }
+        }
+
+        if (!rawResponse) {
+          return json({ error: `AI model error: ${aiErrMessage || 'No AI model available'}` }, { status: 500 });
         }
 
         let changedFiles = parseMultiFile(rawResponse);

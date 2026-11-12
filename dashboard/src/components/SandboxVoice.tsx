@@ -22,6 +22,12 @@ const GARBAGE_REGEX =
   /^(?:um+|uh+|hm+|ah+|oh+|like|yeah|nope|okay|ok\s*)$|^[\s.,?!\-–—;:'"]+$/i;
 const SPEAKING_DEBOUNCE_MS = 500;
 
+const BrowserSpeechRecognition =
+  typeof window !== "undefined"
+    ? (window as any).SpeechRecognition ||
+      (window as any).webkitSpeechRecognition
+    : null;
+
 const NO_ACTION_PHRASES = [
   "no clear request",
   "no actionable request",
@@ -130,11 +136,13 @@ type StatusUpdate = { id: string; text: string };
 type SandboxVoiceProps = {
   sandboxId: string;
   emotionColor?: "green" | "yellow" | "red";
+  onFilesUpdated?: (files: string[]) => void;
 };
 
 export function SandboxVoice({
   sandboxId,
   emotionColor = "yellow",
+  onFilesUpdated,
 }: SandboxVoiceProps) {
   const [isListening, setIsListening] = useState(false);
   const [sttError, setSttError] = useState<string | null>(null);
@@ -168,6 +176,10 @@ export function SandboxVoice({
   const committedRef = useRef("");
   const partialRef = useRef("");
   const isTranscribingRef = useRef(false);
+  const recognitionRef = useRef<any>(null);
+  const isToggleRecordingRef = useRef<boolean>(false);
+  const hasBrowserSpeech = Boolean(BrowserSpeechRecognition);
+  const canVoice = isListening || hasBrowserSpeech;
   /** Minimum hold duration (ms) before we send captured audio to AI. Prevents accidental clicks from triggering capture. */
   const MIN_HOLD_MS = 400;
   const holdStartTimeRef = useRef<number>(0);
@@ -195,33 +207,53 @@ export function SandboxVoice({
 
   const playTts = useCallback(async (text: string) => {
     setTtsPlaying(true);
+    let played = false;
     try {
       const res = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text }),
       });
-      if (!res.ok) throw new Error("TTS failed");
-      const buf = await res.arrayBuffer();
-      const blob = new Blob([buf], { type: "audio/mpeg" });
-      const url = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-      await new Promise<void>((resolve) => {
-        audio.onended = () => {
-          URL.revokeObjectURL(url);
-          resolve();
-        };
-        audio.onerror = () => {
-          URL.revokeObjectURL(url);
-          resolve();
-        };
-        audio.play().catch(resolve);
-      });
+      if (res.ok) {
+        const buf = await res.arrayBuffer();
+        const blob = new Blob([buf], { type: "audio/mpeg" });
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        await new Promise<void>((resolve) => {
+          audio.onended = () => {
+            URL.revokeObjectURL(url);
+            resolve();
+          };
+          audio.onerror = () => {
+            URL.revokeObjectURL(url);
+            resolve();
+          };
+          audio.play().catch(resolve);
+        });
+        played = true;
+      }
     } catch {
-      /* silent */
-    } finally {
-      setTtsPlaying(false);
+      /* Fall through to browser speech synthesis */
     }
+
+    if (!played && typeof window !== "undefined" && "speechSynthesis" in window) {
+      try {
+        await new Promise<void>((resolve) => {
+          window.speechSynthesis.cancel();
+          const utterance = new SpeechSynthesisUtterance(text);
+          utterance.rate = 1.0;
+          utterance.pitch = 1.0;
+          utterance.onend = () => resolve();
+          utterance.onerror = () => resolve();
+          window.speechSynthesis.speak(utterance);
+          setTimeout(resolve, 6000);
+        });
+      } catch {
+        /* silent */
+      }
+    }
+
+    setTtsPlaying(false);
   }, []);
 
   // ── request pipeline (refine → run) ──
@@ -282,9 +314,23 @@ export function SandboxVoice({
         const iframe = document.getElementById(
           "sandboxFrame",
         ) as HTMLIFrameElement | null;
-        if (iframe) iframe.src = iframe.src;
+        if (iframe) {
+          try {
+            const u = new URL(iframe.src);
+            u.searchParams.set("_t", Date.now().toString());
+            iframe.src = u.toString();
+          } catch {
+            iframe.src = iframe.src;
+          }
+        }
 
-        addStatus("Changes applied!");
+        if (result.written && result.written.length > 0) {
+          onFilesUpdated?.(result.written);
+          addStatus(`Updated: ${result.written.join(", ")}`);
+        } else {
+          addStatus("Changes applied!");
+        }
+
         await playTts(pickRandom(PREDEFINED_RESPONSES));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -437,12 +483,24 @@ export function SandboxVoice({
                 .catch(() => {});
             }
           } else if (msg.type === "error") {
-            setSttError(msg.message || "STT error");
+            const isAuthOrQuota = /authenticated|unauthorized|api.key|permission|quota/i.test(msg.message || "");
+            if (isAuthOrQuota) {
+              cancelled = true;
+              if (!hasBrowserSpeech) {
+                setSttError(msg.message || "STT error");
+              }
+            } else {
+              setSttError(msg.message || "STT error");
+            }
           } else if (msg.type === "upstream_closed") {
             const reason = String(msg.reason ?? "");
-            if (!/\(1000\)|normal/i.test(reason))
-              setSttError(reason || "STT connection closed");
-            else setSttError(null);
+            if (!/\(1000\)|normal/i.test(reason)) {
+              if (!hasBrowserSpeech && !/authenticated|unauthorized/i.test(reason)) {
+                setSttError(reason || "STT connection closed");
+              }
+            } else {
+              setSttError(null);
+            }
           }
         } catch {
           /* ignore */
@@ -580,10 +638,10 @@ export function SandboxVoice({
     if (text) processPrompt(text, "text");
   }, [textInput, exitTextMode, processPrompt]);
 
-  const enterTranscribing = useCallback(() => {
+  const enterTranscribing = useCallback((isToggle = false) => {
     if (isProcessing || ttsPlaying || modeRef.current === "text") return;
     holdStartTimeRef.current = Date.now();
-    // Start a fresh buffer for this hold; only what arrives from now until release is sent to AI
+    isToggleRecordingRef.current = isToggle;
     capturedDuringHoldRef.current = "";
     setCapturedDuringHoldState("");
     partialRef.current = "";
@@ -591,19 +649,79 @@ export function SandboxVoice({
     isTranscribingRef.current = true;
     setMode("transcribing");
     modeRef.current = "transcribing";
+
+    // Always start browser Web Speech API if supported
+    if (BrowserSpeechRecognition) {
+      try {
+        if (recognitionRef.current) {
+          try {
+            recognitionRef.current.onend = null;
+            recognitionRef.current.stop();
+          } catch {}
+          recognitionRef.current = null;
+        }
+        const rec = new BrowserSpeechRecognition();
+        rec.continuous = true;
+        rec.interimResults = true;
+        rec.lang = "en-US";
+        rec.onresult = (e: any) => {
+          let interim = "";
+          let final = "";
+          for (let i = e.resultIndex; i < e.results.length; ++i) {
+            if (e.results[i].isFinal) final += e.results[i][0].transcript;
+            else interim += e.results[i][0].transcript;
+          }
+          if (interim) {
+            partialRef.current = interim;
+            setTranscript((prev) => ({ ...prev, partial: interim }));
+            setIsSpeaking(true);
+            if (speakingTimeoutRef.current) clearTimeout(speakingTimeoutRef.current);
+            speakingTimeoutRef.current = setTimeout(() => setIsSpeaking(false), SPEAKING_DEBOUNCE_MS);
+          }
+          if (final) {
+            const trimmed = final.trim();
+            if (trimmed) {
+              capturedDuringHoldRef.current += (capturedDuringHoldRef.current ? " " : "") + trimmed;
+              setCapturedDuringHoldState(capturedDuringHoldRef.current);
+              committedRef.current += (committedRef.current ? " " : "") + trimmed;
+              setTranscript((prev) => ({ ...prev, committed: committedRef.current, partial: "" }));
+            }
+          }
+        };
+        rec.onerror = (e: any) => {
+          if (e.error !== "no-speech") {
+            console.warn("[WebSpeech] recognition error:", e.error);
+          }
+        };
+        rec.onend = () => {
+          if (isTranscribingRef.current) {
+            try {
+              rec.start();
+            } catch {}
+          }
+        };
+        recognitionRef.current = rec;
+        rec.start();
+      } catch (err) {
+        console.warn("[WebSpeech] start failed:", err);
+      }
+    }
   }, [isProcessing, ttsPlaying]);
 
-  const exitTranscribing = useCallback(() => {
+  const finishAndSend = useCallback(() => {
     if (!isTranscribingRef.current) return;
-    const heldMs = Date.now() - holdStartTimeRef.current;
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.onend = null;
+        recognitionRef.current.stop();
+      } catch {}
+      recognitionRef.current = null;
+    }
     isTranscribingRef.current = false;
+    isToggleRecordingRef.current = false;
     setMode("idle");
     modeRef.current = "idle";
 
-    // Only send to AI if user held long enough (prevents accidental clicks from triggering capture)
-    if (heldMs < MIN_HOLD_MS) return;
-
-    // Send only what was accumulated during this hold (committed + current partial)
     let captured = (
       capturedDuringHoldRef.current +
       (partialRef.current ? " " + partialRef.current : "")
@@ -611,8 +729,35 @@ export function SandboxVoice({
     if (captured.length > MAX_VOICE_PROMPT_CHARS) {
       captured = captured.slice(-MAX_VOICE_PROMPT_CHARS).trim();
     }
-    if (captured) processPrompt(captured, "voice");
-  }, [processPrompt]);
+    if (captured) {
+      processPrompt(captured, "voice");
+    } else {
+      addStatus("No speech detected");
+    }
+  }, [processPrompt, addStatus]);
+
+  const handleFaceMouseDown = useCallback(() => {
+    if (isToggleRecordingRef.current) {
+      finishAndSend();
+      return;
+    }
+    enterTranscribing(false);
+  }, [enterTranscribing, finishAndSend]);
+
+  const handleFaceMouseUp = useCallback(() => {
+    if (!isTranscribingRef.current) return;
+    const heldMs = Date.now() - holdStartTimeRef.current;
+    if (heldMs < MIN_HOLD_MS) {
+      isToggleRecordingRef.current = true;
+      addStatus("Listening… Click face again or Send to apply");
+      return;
+    }
+    finishAndSend();
+  }, [finishAndSend, addStatus]);
+
+  const exitTranscribing = useCallback(() => {
+    finishAndSend();
+  }, [finishAndSend]);
 
   // ── click outside (text mode) ──
 
@@ -805,8 +950,23 @@ export function SandboxVoice({
                   <span className="ml-1 inline-block h-3 w-0.5 animate-pulse bg-white/60" />
                 </p>
               ) : (
-                <p className="text-white/40 italic">Listening…</p>
+                <p className="text-white/40 italic">Listening… speak your instruction</p>
               )}
+              <div className="flex items-center justify-between mt-2 pt-2 border-t border-white/10">
+                <span className="text-[11px] text-white/50">
+                  {isToggleRecordingRef.current ? "Click icon or button to send" : "Release or click to send"}
+                </span>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    finishAndSend();
+                  }}
+                  className="px-2.5 py-1 text-xs font-medium rounded-md bg-white/20 hover:bg-white/30 text-white transition-colors cursor-pointer"
+                >
+                  Send & Update
+                </button>
+              </div>
             </motion.div>
           )}
         </AnimatePresence>
@@ -822,22 +982,22 @@ export function SandboxVoice({
               {/* face icon with pulsing emotion ring */}
               <button
                 type="button"
-                className="relative flex items-center justify-center disabled:opacity-50"
-                onMouseDown={enterTranscribing}
-                onMouseUp={exitTranscribing}
+                className="relative flex items-center justify-center disabled:opacity-50 cursor-pointer"
+                onMouseDown={handleFaceMouseDown}
+                onMouseUp={handleFaceMouseUp}
                 onMouseLeave={() => {
-                  if (isTranscribingRef.current) exitTranscribing();
+                  if (isTranscribingRef.current && !isToggleRecordingRef.current) finishAndSend();
                 }}
                 onTouchStart={(e) => {
                   e.preventDefault();
-                  enterTranscribing();
+                  handleFaceMouseDown();
                 }}
                 onTouchEnd={(e) => {
                   e.preventDefault();
-                  exitTranscribing();
+                  handleFaceMouseUp();
                 }}
-                disabled={isProcessing || ttsPlaying || !isListening}
-                aria-label="Hold to speak"
+                disabled={isProcessing || ttsPlaying || !canVoice}
+                aria-label="Hold or click to speak"
               >
                 <span
                   className={cn(
@@ -868,7 +1028,7 @@ export function SandboxVoice({
                 type="button"
                 onClick={enterTextMode}
                 disabled={isProcessing || ttsPlaying}
-                className="flex h-9 w-9 items-center justify-center rounded-full hover:bg-white/10 transition-colors disabled:opacity-50"
+                className="flex h-9 w-9 items-center justify-center rounded-full hover:bg-white/10 transition-colors disabled:opacity-50 cursor-pointer"
                 aria-label="Type a prompt"
               >
                 <Pencil className="h-4 w-4 text-white/70" />
@@ -919,12 +1079,17 @@ export function SandboxVoice({
           {mode === "transcribing" && (
             <div className="flex items-center gap-4 px-5 py-3">
               {/* face icon (active recording) */}
-              <div className="relative flex items-center justify-center">
+              <button
+                type="button"
+                onClick={finishAndSend}
+                className="relative flex items-center justify-center cursor-pointer"
+                aria-label="Stop recording and apply"
+              >
                 <span className="absolute inset-[-4px] rounded-full animate-ping ring-[3px] ring-red-500/40" />
                 <span className="relative flex h-9 w-9 items-center justify-center rounded-full bg-red-500/20">
                   <EmotionFaceIcon className="h-5 w-5 text-red-400" />
                 </span>
-              </div>
+              </button>
 
               {/* expanded audio lines */}
               <AudioLinesIcon
@@ -938,8 +1103,8 @@ export function SandboxVoice({
         </div>
       </div>
 
-      {/* ── STT error ── */}
-      {sttError && (
+      {/* ── STT error (only shown if browser speech recognition is unavailable) ── */}
+      {sttError && !hasBrowserSpeech && (
         <div className="fixed bottom-2 left-1/2 -translate-x-1/2 z-40 rounded-lg bg-red-500/90 px-3 py-1.5 text-xs text-white shadow-lg">
           {sttError}
         </div>

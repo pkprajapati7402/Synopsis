@@ -59,6 +59,25 @@ export async function initSandbox(params: {
   });
 }
 
+export type UploadFilesResponse =
+  | {
+      status: "uploaded";
+      files: string[];
+    }
+  | {
+      error: string;
+    };
+
+export async function uploadSandboxFiles(params: {
+  sandboxId: string;
+  files: Record<string, string>;
+}): Promise<UploadFilesResponse> {
+  return callWorker<UploadFilesResponse>(`/s/${params.sandboxId}/api/upload`, {
+    method: "POST",
+    body: JSON.stringify({ files: params.files }),
+  });
+}
+
 export type ListFilesResponse = {
   files: string[];
 };
@@ -67,6 +86,16 @@ export async function listFiles(params: {
   sandboxId: string;
 }): Promise<ListFilesResponse> {
   return callWorker<ListFilesResponse>(`/s/${params.sandboxId}/api/files`);
+}
+
+export type ExportFilesResponse = {
+  files: Record<string, string>;
+};
+
+export async function exportSandboxFiles(params: {
+  sandboxId: string;
+}): Promise<ExportFilesResponse> {
+  return callWorker<ExportFilesResponse>(`/s/${params.sandboxId}/api/export`);
 }
 
 export type PromptHistoryEntry = {

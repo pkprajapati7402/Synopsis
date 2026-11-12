@@ -226,7 +226,10 @@ function parseGitHubUrl(url: string): { owner: string; repo: string } | null {
 }
 
 async function fetchGitHubFile(owner: string, repo: string, path: string, token?: string): Promise<string | null> {
-  const headers: Record<string, string> = { Accept: 'application/vnd.github.raw+json' };
+  const headers: Record<string, string> = {
+    Accept: 'application/vnd.github.raw+json',
+    'User-Agent': 'synapse-app',
+  };
   if (token) headers['Authorization'] = `Bearer ${token}`;
   const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${path}`, { headers });
   if (!res.ok) return null;
@@ -234,7 +237,10 @@ async function fetchGitHubFile(owner: string, repo: string, path: string, token?
 }
 
 async function fetchGitHubTree(owner: string, repo: string, token?: string): Promise<{ path: string; type: string }[]> {
-  const headers: Record<string, string> = { Accept: 'application/vnd.github+json' };
+  const headers: Record<string, string> = {
+    Accept: 'application/vnd.github+json',
+    'User-Agent': 'synapse-app',
+  };
   if (token) headers['Authorization'] = `Bearer ${token}`;
   const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/HEAD?recursive=1`, { headers });
   if (!res.ok) throw new Error(`GitHub API error: ${res.status}`);
@@ -422,25 +428,40 @@ export const importFromGitHub = action({
         if (content === null) return;
         if (path.endsWith('.css')) {
           cssContent += content + '\n';
-        } else {
-          allSources[path] = content;
         }
+        allSources[path] = content;
       })
     );
 
-    // Detect entry file
-    const entryFile = ['src/main.tsx', 'src/main.jsx', 'src/index.tsx', 'src/index.jsx', 'src/App.tsx']
-      .find((e) => allSources[e]) ?? Object.keys(allSources)[0];
+    // Detect React entry file
+    const reactEntryFile = ['src/main.tsx', 'src/main.jsx', 'src/index.tsx', 'src/index.jsx', 'src/App.tsx']
+      .find((e) => allSources[e]);
 
-    // Build a single-page app with Babel standalone for JSX
-    const generatedHtml = generateIndexHtml(repo, allSources, cssContent, deps, entryFile);
+    const outputFiles: Record<string, string> = {};
 
-    const outputFiles: Record<string, string> = { 'index.html': generatedHtml };
-    if (cssContent) outputFiles['styles.css'] = cssContent;
+    if (reactEntryFile) {
+      // Build a single-page app with Babel standalone for JSX
+      const generatedHtml = generateIndexHtml(repo, allSources, cssContent, deps, reactEntryFile);
+      outputFiles['index.html'] = generatedHtml;
+      if (cssContent) outputFiles['styles.css'] = cssContent;
+    } else {
+      // Static web app (HTML / CSS / JS): preserve all pages and scripts
+      for (const [filePath, content] of Object.entries(allSources)) {
+        const filename = filePath.split('/').pop() || filePath;
+        outputFiles[filename] = content;
+      }
+      if (cssContent && !outputFiles['styles.css']) {
+        outputFiles['styles.css'] = cssContent;
+      }
+    }
 
     // Upload to sandbox via worker
     const workerBase = process.env.WORKER_BASE_URL;
     if (!workerBase) throw new Error('WORKER_BASE_URL not set in Convex env');
+    if (workerBase.includes('localhost') || workerBase.includes('127.0.0.1')) {
+      console.log(`[importFromGitHub] Local dev mode: compiled ${Object.keys(outputFiles).length} files from GitHub. Returning outputFiles to client.`);
+      return { ok: true, local: true, files: Object.keys(outputFiles), outputFiles };
+    }
     const uploadUrl = `${workerBase.replace(/\/$/, '')}/s/${args.sandboxId}/api/upload`;
     const uploadRes = await fetch(uploadUrl, {
       method: 'POST',
@@ -452,7 +473,7 @@ export const importFromGitHub = action({
       throw new Error(`Upload failed (${uploadRes.status}): ${err || uploadRes.statusText}. Ensure WORKER_BASE_URL in Convex env points to your deployed worker (not localhost) and the worker is deployed with the latest code.`);
     }
 
-    return { ok: true, files: Object.keys(outputFiles) };
+    return { ok: true, files: Object.keys(outputFiles), outputFiles };
   },
 });
 
@@ -515,14 +536,16 @@ export const getSandboxForCurrentUser = query({
       .filter((q) => q.eq(q.field("id"), projectId))
       .first();
     if (!project) return null;
-    if (project.userId === userId) return row;
+    if (project.userId === userId) {
+      return { ...row, githubRepo: project.githubRepo, projectName: project.name };
+    }
     const member = await ctx.db
       .query("projectMembers")
       .withIndex("by_projectId_userId", (q) =>
         q.eq("projectId", projectId).eq("userId", userId),
       )
       .first();
-    return member ? row : null;
+    return member ? { ...row, githubRepo: project.githubRepo, projectName: project.name } : null;
   },
 });
 
@@ -616,6 +639,11 @@ export const ensureSandboxOnWorker = action({
     if (!base) {
       throw new Error("WORKER_BASE_URL is not set in Convex environment");
     }
+    // Convex cloud functions cannot fetch loopback addresses (localhost / 127.0.0.1).
+    // In local dev, return gracefully and allow the client browser to initialize directly.
+    if (base.includes("localhost") || base.includes("127.0.0.1")) {
+      return { local: true };
+    }
     const url = `${base.replace(/\/$/, "")}/s/${args.sandboxId}/api/init`;
     const res = await fetch(url, {
       method: "POST",
@@ -657,14 +685,19 @@ async function githubFetch(
  * to be set in the Convex environment.
  */
 export const createPullRequest = action({
-  args: { sandboxId: v.string() },
+  args: {
+    sandboxId: v.string(),
+    files: v.optional(v.record(v.string(), v.string())),
+    githubToken: v.optional(v.string()),
+  },
   handler: async (ctx, args) => {
     const workerBase = process.env.WORKER_BASE_URL;
-    const githubToken = process.env.GITHUB_TOKEN;
+    const githubToken = args.githubToken ?? process.env.GITHUB_TOKEN;
     const smKey = process.env.SUPERMEMORY_API_KEY;
 
-    if (!workerBase) throw new Error("WORKER_BASE_URL is not set");
-    if (!githubToken) throw new Error("GITHUB_TOKEN is not set");
+    if (!githubToken) {
+      throw new Error("GITHUB_TOKEN is not set. Please set GITHUB_TOKEN in your Convex environment or pass it to createPullRequest.");
+    }
 
     // Resolve the GitHub repo from the project the sandbox belongs to
     const sandbox = await ctx.runQuery(api.sandboxes.getSandboxForCurrentUser, {
@@ -683,14 +716,19 @@ export const createPullRequest = action({
     githubRepo = githubRepo ?? process.env.GITHUB_REPO;
     if (!githubRepo) throw new Error("No GitHub repo configured for this project. Set one when creating the project.");
 
-    const exportUrl = `${workerBase.replace(/\/$/, "")}/s/${args.sandboxId}/api/export`;
-    const exportRes = await fetch(exportUrl);
-    if (!exportRes.ok) {
-      throw new Error(`Failed to export sandbox files: ${exportRes.status}`);
+    let files = args.files;
+    if (!files || Object.keys(files).length === 0) {
+      if (!workerBase) throw new Error("WORKER_BASE_URL is not set");
+      const exportUrl = `${workerBase.replace(/\/$/, "")}/s/${args.sandboxId}/api/export`;
+      const exportRes = await fetch(exportUrl);
+      if (!exportRes.ok) {
+        throw new Error(`Failed to export sandbox files: ${exportRes.status}`);
+      }
+      const data = (await exportRes.json()) as {
+        files: Record<string, string>;
+      };
+      files = data.files;
     }
-    const { files } = (await exportRes.json()) as {
-      files: Record<string, string>;
-    };
     if (!files || Object.keys(files).length === 0) {
       throw new Error("No files found in sandbox");
     }
@@ -730,12 +768,27 @@ export const createPullRequest = action({
 
     const branchName = `sandbox/${args.sandboxId}`;
 
+    // Get default branch dynamically (main, master, etc.)
+    let defaultBranch = "main";
+    try {
+      const repoInfoRes = await githubFetch(`/repos/${githubRepo}`, githubToken);
+      if (repoInfoRes.ok) {
+        const repoInfo = (await repoInfoRes.json()) as { default_branch?: string };
+        if (repoInfo.default_branch) defaultBranch = repoInfo.default_branch;
+      }
+    } catch {}
+
     const mainRef = await githubFetch(
-      `/repos/${githubRepo}/git/ref/heads/main`,
+      `/repos/${githubRepo}/git/ref/heads/${defaultBranch}`,
       githubToken,
     );
     if (!mainRef.ok) {
-      throw new Error(`Failed to get main branch: ${mainRef.status}`);
+      if (mainRef.status === 404 || mainRef.status === 403 || mainRef.status === 401) {
+        throw new Error(
+          `GitHub returned status ${mainRef.status}. Ensure your GITHUB_TOKEN is valid and has write access to '${githubRepo}'. (If this is someone else's repo, fork it to your own GitHub account and link your fork).`
+        );
+      }
+      throw new Error(`Failed to get ${defaultBranch} branch: ${mainRef.status}`);
     }
     const mainData = (await mainRef.json()) as {
       object: { sha: string };
@@ -821,7 +874,7 @@ export const createPullRequest = action({
         body: JSON.stringify({
           title: `Sandbox: ${args.sandboxId}`,
           head: branchName,
-          base: "main",
+          base: defaultBranch,
           body: prBody,
         }),
       },

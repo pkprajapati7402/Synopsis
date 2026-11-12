@@ -45,6 +45,8 @@ import {
 } from "@/components/ui/context-menu";
 import { timeAgo } from "@/lib/sandbox-utils";
 
+import { exportSandboxFiles } from "@/lib/workerClient";
+
 export type SandboxEntry = {
   id: string;
   name: string;
@@ -219,8 +221,38 @@ export function SandboxCard({
     e.stopPropagation();
     setPrLoading(true);
     try {
-      const result = await createPR({ sandboxId: sandbox.id });
+      let files: Record<string, string> | undefined;
+      try {
+        const exported = await exportSandboxFiles({ sandboxId: sandbox.id });
+        files = exported.files;
+      } catch (err) {
+        console.warn("Could not export files locally:", err);
+      }
+      let token =
+        process.env.NEXT_PUBLIC_GITHUB_TOKEN ||
+        (typeof window !== "undefined" ? localStorage.getItem("synapse_github_token") : null);
+
+      if (!token) {
+        const inputToken = window.prompt(
+          "Enter your GitHub Personal Access Token (classic) to create the pull request on GitHub:\n\nTip: You can create a token with 'repo' scope at:\nhttps://github.com/settings/tokens"
+        );
+        if (!inputToken || !inputToken.trim()) {
+          setPrLoading(false);
+          return;
+        }
+        token = inputToken.trim();
+        if (typeof window !== "undefined") {
+          localStorage.setItem("synapse_github_token", token);
+        }
+      }
+
+      const result = await createPR({
+        sandboxId: sandbox.id,
+        files,
+        githubToken: token,
+      });
       setPrResult(result.prUrl);
+      window.open(result.prUrl, "_blank");
     } catch (err) {
       console.error("Create PR failed:", err);
     } finally {
